@@ -1,0 +1,196 @@
+#
+#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#  SPDX-License-Identifier: MIT-0
+# 
+#  Permission is hereby granted, free of charge, to any person obtaining a
+#  copy of this software and associated documentation files (the "Software"),
+#  to deal in the Software without restriction, including without limitation
+#  the rights to use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of the Software, and to permit persons to whom the
+#  Software is furnished to do so. 
+# 
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+#  DEALINGS IN THE SOFTWARE. 
+# 
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+
+  This template creates receiver and sender multicast tasks, 
+  CloudWatch Log group secured by a KMS Customer Managed Key. 
+  It then creates a Security Group allowing UDP and IGMP traffic. 
+  Multicast receiver and sender services get deployed using the task definitions on a 
+  previous provisioned ECS cluster. 
+
+  Last Modified: 8 March 2022
+  Author: Yuri Gordienko <yurgor@amazon.com>
+  
+Parameters:
+  VPCID:
+    Description: Please enter a VPC ID created by the previous stack
+    Type: String
+  Subnets:
+    Description: Please enter SUbnet IDs created by the previous stack
+    Type: CommaDelimitedList
+  ECSCluster:
+    Description: Please enter a cluster name created by the previous stack
+    Type: String
+    Default: ECSMulticastBlog
+  ReceiverServiceDesiredCount:
+    Description: Please enter a desired number of receiver containers
+    Type: Number
+    Default: 2
+  SenderServiceDesiredCount:
+    Description: Please enter a desired number of sender containers
+    Type: Number
+    Default: 1
+  SenderContainerImage:
+    Description: Please enter a link to a sender container created by you
+    Type: String
+  ReceiverContainerImage:
+    Description: Please enter a link to a receiver container created by you
+    Type: String
+  ECSMulticastBlogLogGroup:
+    Description: Please enter a log group name in CloudWatch
+    Type: String
+    Default: ECSMulticastBlogLogGroup  
+
+
+Resources:
+  CloudWatchKMS:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: ECS Multicast Blog - CloudWatch KMS Key for VPC logs
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Cloudwatch Access
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt CloudWatchKMS.Arn
+      LogGroupName: !Ref ECSMulticastBlogLogGroup
+      RetentionInDays: 7
+      
+  ReceiverTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: MulticastReceiver
+          Essential: true
+          Image: !Ref ReceiverContainerImage
+          Memory: 512
+          Cpu: 1
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref CloudwatchLogsGroup
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: yes
+
+  SenderTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: MulticastSender
+          Essential: true
+          Image: !Ref SenderContainerImage
+          Memory: 512
+          Cpu: 1
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref CloudwatchLogsGroup
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: yes
+
+  SGMulticast:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Multicast ECS Blog Secutiry Group
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          Description: Ingress multicast traffic (UDP)
+          FromPort: '0'
+          ToPort: '65535'
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: 2
+          Description: IGMP Receivers
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: 2
+          Description: IGMP Querier
+          CidrIp: 0.0.0.0/32
+      SecurityGroupEgress:
+        - IpProtocol: all
+          Description: Egress multicast traffic (UDP)
+          FromPort: '0'
+          ToPort: '65535'
+          CidrIp: 224.0.0.0/4
+
+  ReceiverService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      Name: ReceiverService
+      DesiredCount: !Ref ReceiverServiceDesiredCount
+      TaskDefinition: !Ref ReceiverTask
+      NetworkConfiguration:
+        AwsvpcConfiguration: 
+          SecurityGroups: 
+            - !Ref SGMulticast
+          AssignPublicIp: DISABLED
+          Subnets: !Ref Subnets
+          
+  SenderService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      Name: SenderService
+      DesiredCount: !Ref SenderServiceDesiredCount
+      TaskDefinition: !Ref SenderTask
+      NetworkConfiguration:
+        AwsvpcConfiguration: 
+          SecurityGroups: 
+            - !Ref SGMulticast
+          AssignPublicIp: DISABLED
+          Subnets: !Ref Subnets
+          
+Outputs:
+  ReceiverServiceOutput:
+    Description: A reference to the Receiver service
+    Value: !Ref ReceiverService
+    
+  SenderServiceOutput:
+    Description: A reference to the Sender service
+    Value: !Ref SenderService

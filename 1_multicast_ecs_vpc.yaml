@@ -1,0 +1,471 @@
+#
+#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#  SPDX-License-Identifier: MIT-0
+# 
+#  Permission is hereby granted, free of charge, to any person obtaining a
+#  copy of this software and associated documentation files (the "Software"),
+#  to deal in the Software without restriction, including without limitation
+#  the rights to use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of the Software, and to permit persons to whom the
+#  Software is furnished to do so. 
+# 
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+#  DEALINGS IN THE SOFTWARE. 
+# 
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+
+  This template deploys a VPC with VPC Flow Logs in CloudWatch secured by a KMS Customer Managed Key, 
+  creates a pair of public and private subnets spread 
+  across two Availabilty Zones. It deploys an Internet Gateway, NAT gateways, 
+  and configures default routing. 
+  It deploys a Transit Gateway and creates VPC attachments. 
+  It creates a Multicast Domain with subnet associations. 
+  
+  It then deploys a highly available ECS cluster using an AutoScaling Group, with 
+  two ECS container instances distributed across two Availability Zones. 
+
+  Last Modified: 8 March 2022
+  Author: Yuri Gordienko <yurgor@amazon.com>
+
+Parameters:
+  VPCName:
+    Description: Please enter the name for this VPC
+    Type: String
+    Default: ECS Multicast Blog VPC
+
+  VPCCIDR:
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  VPCPublic1CIDR:
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.0.0/24
+
+  VPCPublic2CIDR:
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 10.0.1.0/24
+    
+  VPCPrivate1CIDR:
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.2.0/24
+
+  VPCPrivate2CIDR:
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
+    Type: String
+    Default: 10.0.3.0/24
+
+  LatestECSOptimizedAMI:
+    Description: AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+
+  InstanceType:
+    Description: EC2 instance type for ECS worker nodes
+    Type: String
+    Default: t3.small
+
+Resources:
+  CloudWatchKMS:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: ECS Multicast Blog - CloudWatch KMS Key for container logs
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Cloudwatch Access
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt CloudWatchKMS.Arn
+      RetentionInDays: 7
+      
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'vpc-flow-logs.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: 'VPCFlowLogsPolicy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            - 'logs:DescribeLogGroups'
+            - 'logs:DescribeLogStreams'
+            Resource: !GetAtt 'VPCFlowLogGroup.Arn'
+      
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref VPCName
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt 'FlowLogsRole.Arn'
+      LogGroupName: !Ref VPCFlowLogGroup
+      ResourceId: !Ref VPC
+      ResourceType: 'VPC'
+      TrafficType: ALL
+      
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref VPCName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  VPCPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref VPCPublic1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Public Subnet (AZ1)
+          
+  VPCPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: !Ref VPCPublic2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Public Subnet (AZ2)
+
+  VPCPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref VPCPrivate1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Private Subnet (AZ1)
+          
+  VPCPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: !Ref VPCPrivate2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Private Subnet (AZ2)
+          
+  PublicRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Public Route Table
+          
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Private Route Table 1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${VPCName} Private Route Table 2
+
+  DefaultPublicRoute1:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      
+  VPCPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable1
+      SubnetId: !Ref VPCPublicSubnet1
+
+  VPCPublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable1
+      SubnetId: !Ref VPCPublicSubnet2
+
+  VPCPrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref VPCPrivateSubnet1
+
+  VPCPrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref VPCPrivateSubnet2
+
+  ElasticIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: 
+        - Key: Name
+          Value: ECSMulticastBlog
+    
+  NATGWY1:
+    Type:  AWS::EC2::NatGateway
+    DependsOn: ElasticIP1
+    Properties:
+      AllocationId: !GetAtt ElasticIP1.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref VPCPublicSubnet1
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+  
+  ElasticIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties: 
+      Domain: vpc
+      Tags: 
+        - Key: Name
+          Value: ECSMulticastBlog
+    
+  NATGWY2:
+    Type:  AWS::EC2::NatGateway
+    DependsOn: ElasticIP2
+    Properties:
+      AllocationId: !GetAtt ElasticIP2.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref VPCPublicSubnet2
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+      
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    DependsOn: NATGWY1
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGWY1
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    DependsOn: NATGWY2
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGWY2              
+      
+  TransitGWY:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: Transit Gateway with Multicast Support
+      MulticastSupport: enable
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+
+  TransitGWYAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties: 
+      SubnetIds: [ !Ref VPCPrivateSubnet1, !Ref VPCPrivateSubnet2 ]
+      TransitGatewayId: !Ref TransitGWY
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+
+  MCastTGWMulticastDomain:
+    Type: AWS::EC2::TransitGatewayMulticastDomain
+    DependsOn: TransitGWYAttachment
+    Properties:
+      TransitGatewayId: !Ref 'TransitGWY'
+      Options:
+        Igmpv2Support: 'enable'
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+          
+  MCastTGWMulticastDomainPrivateSubnetAssociation1:
+    Type: AWS::EC2::TransitGatewayMulticastDomainAssociation
+    DependsOn: MCastTGWMulticastDomain
+    Properties:
+      SubnetId: !Ref 'VPCPrivateSubnet1'
+      TransitGatewayAttachmentId: !Ref 'TransitGWYAttachment'
+      TransitGatewayMulticastDomainId: !Ref 'MCastTGWMulticastDomain'
+
+  MCastTGWMulticastDomainPrivateSubnetAssociation2:
+    Type: AWS::EC2::TransitGatewayMulticastDomainAssociation
+    DependsOn: MCastTGWMulticastDomain
+    Properties:
+      SubnetId: !Ref 'VPCPrivateSubnet2'
+      TransitGatewayAttachmentId: !Ref 'TransitGWYAttachment'
+      TransitGatewayMulticastDomainId: !Ref 'MCastTGWMulticastDomain'
+ 
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ec2.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      InstanceProfileName: ECSMulticastBlog
+      Roles:
+        - !Ref ECSRole
+
+  ContainerInstances:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref LatestECSOptimizedAMI
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          cat >/etc/sysctl.d/99-igmpv2.conf <<EOF
+          # Force kernel to use IGMP v2 rather than default to v3
+          net.ipv4.conf.all.force_igmp_version=2
+          EOF
+          sysctl -p /etc/sysctl.d/99-igmpv2.conf
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+
+  myASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      MaxSize: '3'
+      DesiredCapacity: '2'
+      LaunchConfigurationName: !Ref ContainerInstances
+      VPCZoneIdentifier: [ !Ref VPCPrivateSubnet1, !Ref VPCPrivateSubnet2 ]
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+          PropagateAtLaunch: true
+      
+  ECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties: 
+      AutoScalingGroupProvider: 
+        AutoScalingGroupArn: !Ref myASG
+      Name: MulticastECSBlogCapacityProvider
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+          
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ECSMulticastBlog
+      Tags:
+        - Key: Name
+          Value: ECSMulticastBlog
+  
+Outputs:
+  VPCID:
+    Description: A reference to the created VPC
+    Value: !Ref VPC
+
+  VPCSubnetIDs:
+    Description: A list of the private subnets
+    Value: !Join [ ",", [ !Ref VPCPrivateSubnet1, !Ref VPCPrivateSubnet2 ]]
+    
+  TransitGatewayID:
+    Description: A reference to the created Transit Gateway
+    Value: !Ref TransitGWY
+    
+  ECSClusterID:
+    Description: A reference to the created ECS Cluster
+    Value: !Ref ECSCluster
+

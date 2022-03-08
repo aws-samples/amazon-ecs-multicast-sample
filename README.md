@@ -1,11 +1,7 @@
 ## My Project
 
-TODO: Fill this README out!
+Running multicast enabled containers on AWS blog post CloudFormation templates. 
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
 
 ## Security
 

@@ -1,4 +1,4 @@
-## My Project
+## ECS Multicast
 
 Running multicast enabled containers on AWS blog post CloudFormation templates. 
 
